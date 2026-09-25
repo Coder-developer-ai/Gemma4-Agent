@@ -1,591 +1,751 @@
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
+from typing import Any
 
 import requests
-import yaml
 
+
+# ============================================================
+# Configuration
+# ============================================================
 
 SUBMISSION_DIR = Path(__file__).resolve().parent
-OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "gemma4:e2b"
+OLLAMA_URL = os.environ.get(
+    "OLLAMA_URL",
+    "http://localhost:11434/api/chat",
+)
+DEFAULT_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:e2b")
 
-MAX_FILE_SIZE = 200_000
-MAX_TOOL_OUTPUT = 20_000
-MAX_STEPS = 20
+MAX_FILE_SIZE = 300_000
+MAX_TOOL_OUTPUT = 12_000
+MAX_STEPS = 25
 
+
+# ============================================================
+# General helpers
+# ============================================================
+
+def truncate_output(value: Any, limit: int = MAX_TOOL_OUTPUT) -> str:
+    text = str(value)
+
+    if len(text) <= limit:
+        return text
+
+    return text[:limit] + "\n...[output truncated]..."
 
 
 def read_text_file(path: Path) -> str:
     try:
-        if path.stat().st_size > MAX_FILE_SIZE:
-            return f"[File too large: {path}]"
-
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
         return path.read_text(encoding="utf-8", errors="replace")
-
-    except Exception as e:
-        return f"[Error reading {path}: {e}]"
 
 
 def safe_path(workspace: Path, relative_path: str) -> Path:
     """
-    Resolve a path while preventing access outside the workspace.
+    Resolve a repository-relative path while preventing escape
+    outside the selected workspace.
     """
 
     if not relative_path:
-        relative_path = "."
+        raise ValueError("Path cannot be empty.")
 
-    candidate = (workspace / relative_path).resolve()
-    workspace = workspace.resolve()
+    candidate = Path(relative_path)
+
+    if candidate.is_absolute():
+        raise ValueError("Absolute paths are not allowed.")
+
+    resolved = (workspace / candidate).resolve()
+    workspace_resolved = workspace.resolve()
 
     try:
-        candidate.relative_to(workspace)
+        resolved.relative_to(workspace_resolved)
     except ValueError:
-        raise ValueError(
-            f"Path '{relative_path}' is outside the workspace."
-        )
+        raise ValueError("Path escapes the workspace.")
 
-    return candidate
+    return resolved
 
 
-def truncate_output(value) -> str:
-    text = str(value)
+def load_optional(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
 
-    if len(text) > MAX_TOOL_OUTPUT:
-        return text[:MAX_TOOL_OUTPUT] + "\n...[output truncated]"
+    return read_text_file(path)
 
-    return text
 
+# ============================================================
+# Submission context
+# ============================================================
 
 def load_submission_context() -> str:
-    sections = []
+    """
+    Loads the local submission configuration so Gemma can use
+    the same prompts/skills/sub-agent descriptions during local
+    development.
 
+    This does NOT execute Kaggle ADK skills. Kaggle executes the
+    submitted agent through its own harness.
+    """
 
+    sections: list[str] = []
 
-    prompts_dir = SUBMISSION_DIR / "prompts"
+    prompt_files = [
+        SUBMISSION_DIR / "prompts" / "system.md",
+        SUBMISSION_DIR / "prompts" / "localization.md",
+        SUBMISSION_DIR / "prompts" / "debugging.md",
+    ]
 
-    if prompts_dir.exists():
-        for path in sorted(prompts_dir.glob("*.md")):
-            content = read_text_file(path)
+    for path in prompt_files:
+        content = load_optional(path)
 
+        if content:
             sections.append(
                 f"\n===== PROMPT: {path.relative_to(SUBMISSION_DIR)} =====\n"
                 f"{content}"
             )
 
-
     skills_dir = SUBMISSION_DIR / "skills"
 
     if skills_dir.exists():
-        for path in sorted(skills_dir.rglob("*.md")):
-            content = read_text_file(path)
+        for skill_file in sorted(skills_dir.rglob("SKILL.md")):
+            content = load_optional(skill_file)
 
-            sections.append(
-                f"\n===== SKILL: {path.relative_to(SUBMISSION_DIR)} =====\n"
-                f"{content}"
-            )
+            if content:
+                sections.append(
+                    f"\n===== SKILL: "
+                    f"{skill_file.relative_to(SUBMISSION_DIR)} =====\n"
+                    f"{content}"
+                )
 
-   
+            resource_dir = skill_file.parent / "resources"
 
-    agents_dir = SUBMISSION_DIR / "sub_agents"
+            if resource_dir.exists():
+                for resource in sorted(resource_dir.rglob("*")):
+                    if resource.is_file() and resource.suffix.lower() in {
+                        ".md",
+                        ".txt",
+                        ".yaml",
+                        ".yml",
+                        ".json",
+                    }:
+                        content = load_optional(resource)
 
-    if agents_dir.exists():
-        for path in sorted(agents_dir.glob("*.yaml")):
-            content = read_text_file(path)
+                        if content:
+                            sections.append(
+                                f"\n===== SKILL RESOURCE: "
+                                f"{resource.relative_to(SUBMISSION_DIR)} =====\n"
+                                f"{content}"
+                            )
 
-            sections.append(
-                f"\n===== SUB-AGENT: {path.relative_to(SUBMISSION_DIR)} =====\n"
-                f"{content}"
-            )
+    sub_agents_dir = SUBMISSION_DIR / "sub_agents"
+
+    if sub_agents_dir.exists():
+        for config in sorted(sub_agents_dir.glob("*.yaml")):
+            content = load_optional(config)
+
+            if content:
+                sections.append(
+                    f"\n===== SUB-AGENT: "
+                    f"{config.relative_to(SUBMISSION_DIR)} =====\n"
+                    f"{content}"
+                )
 
     return "\n".join(sections)
 
 
+# ============================================================
+# Local tools
+# ============================================================
 
+def list_files(workspace: Path) -> str:
+    """
+    List repository files while excluding generated metadata.
+    """
 
-def list_files(workspace: Path, path: str = "."):
-    target = safe_path(workspace, path)
+    results: list[str] = []
 
-    if not target.exists():
-        return f"Path does not exist: {path}"
-
-    if not target.is_dir():
-        return f"Not a directory: {path}"
-
-    lines = []
-
-    for item in sorted(target.rglob("*")):
-
-        # Ignore Python cache directories
-        if "__pycache__" in item.parts or ".git" in item.parts:
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
             continue
 
-        try:
-            relative = item.relative_to(workspace)
+        relative = path.relative_to(workspace)
 
-            if item.is_dir():
-                lines.append(f"[DIR]  {relative}")
-            else:
-                lines.append(f"[FILE] {relative}")
-
-        except Exception:
+        # Ignore Git internals and Python caches.
+        if ".git" in relative.parts:
             continue
 
-    if not lines:
-        return "[Workspace is empty]"
+        if "__pycache__" in relative.parts:
+            continue
 
-    return "\n".join(lines)
+        if ".pytest_cache" in relative.parts:
+            continue
+
+        if ".mypy_cache" in relative.parts:
+            continue
+
+        if ".venv" in relative.parts:
+            continue
+
+        results.append(relative.as_posix())
+
+        if len(results) >= 1000:
+            break
+
+    if not results:
+        return "(No files found.)"
+
+    return "\n".join(results)
 
 
-def read_file(workspace: Path, path: str):
-    target = safe_path(workspace, path)
+def read_file(workspace: Path, filepath: str) -> str:
+    path = safe_path(workspace, filepath)
 
-    if not target.exists():
-        return f"File does not exist: {path}"
+    if not path.exists():
+        raise FileNotFoundError(f"File does not exist: {filepath}")
 
-    if not target.is_file():
-        return f"Not a file: {path}"
+    if not path.is_file():
+        raise ValueError(f"Not a file: {filepath}")
 
-    return read_text_file(target)
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise ValueError(
+            f"File is larger than {MAX_FILE_SIZE} bytes. "
+            f"Read a smaller file or inspect relevant sections."
+        )
+
+    return truncate_output(read_text_file(path))
 
 
 def search_files(
     workspace: Path,
     query: str,
-    path: str = ".",
-):
-    root = safe_path(workspace, path)
+    file_pattern: str = "*",
+) -> str:
+    if not query:
+        raise ValueError("Search query cannot be empty.")
 
-    if not root.exists():
-        return f"Path does not exist: {path}"
+    results: list[str] = []
 
-    results = []
-
-    for file in root.rglob("*"):
-
-        if not file.is_file():
+    for path in sorted(workspace.rglob(file_pattern)):
+        if not path.is_file():
             continue
 
-        if "__pycache__" in file.parts:
+        relative = path.relative_to(workspace)
+
+        if ".git" in relative.parts:
+            continue
+
+        if "__pycache__" in relative.parts:
+            continue
+
+        if ".venv" in relative.parts:
             continue
 
         try:
-            if file.stat().st_size > MAX_FILE_SIZE:
+            if path.stat().st_size > MAX_FILE_SIZE:
                 continue
 
-            content = file.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
+            text = read_text_file(path)
 
-            if query.lower() in content.lower():
-                relative = file.relative_to(workspace)
-                results.append(str(relative))
+            if query.lower() in text.lower():
+                results.append(relative.as_posix())
 
-        except Exception:
+        except OSError:
             continue
 
+        if len(results) >= 100:
+            break
+
     if not results:
-        return f"No files found containing: {query}"
+        return "No matching files found."
 
     return "\n".join(results)
 
 
 def write_file(
     workspace: Path,
-    path: str,
+    filepath: str,
     content: str,
-):
-    target = safe_path(workspace, path)
+) -> str:
+    path = safe_path(workspace, filepath)
 
     if len(content.encode("utf-8")) > MAX_FILE_SIZE:
-        return "ERROR: File is too large."
+        raise ValueError(
+            f"Content exceeds the {MAX_FILE_SIZE}-byte limit."
+        )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
-    target.write_text(
-        content,
-        encoding="utf-8",
-    )
-
-    return f"Successfully wrote file: {path}"
+    return f"Successfully wrote: {path.relative_to(workspace).as_posix()}"
 
 
 def run_python(
     workspace: Path,
-    script: str,
-):
-    try:
-        result = subprocess.run(
-            ["python", script],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+    filepath: str,
+) -> str:
+    path = safe_path(workspace, filepath)
 
-        output = (
-            f"Return code: {result.returncode}\n\n"
-            f"STDOUT:\n{result.stdout}\n\n"
-            f"STDERR:\n{result.stderr}"
-        )
+    if not path.exists():
+        raise FileNotFoundError(filepath)
 
-        return truncate_output(output)
+    if path.suffix.lower() != ".py":
+        raise ValueError("run_python requires a .py file.")
 
-    except subprocess.TimeoutExpired:
-        return "ERROR: Python execution timed out."
+    result = subprocess.run(
+        [sys.executable, str(path)],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
 
-    except Exception as e:
-        return f"ERROR running Python: {e}"
+    output = (
+        f"returncode={result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
+
+    return truncate_output(output)
 
 
 def run_command(
     workspace: Path,
     command: str,
-):
+) -> str:
     """
-    Execute a command inside the workspace.
+    Local-development command runner.
 
-    Some destructive commands are blocked.
+    Keep this deliberately restricted. The competition harness has
+    its own run_command implementation.
     """
 
-    blocked = [
-        "format",
+    if not command.strip():
+        raise ValueError("Command cannot be empty.")
+
+    lowered = command.lower()
+
+    blocked_fragments = [
+        "format c:",
         "diskpart",
         "shutdown",
         "restart-computer",
-        "remove-item",
-        "del /s",
+        "remove-item -recurse",
         "rmdir /s",
-        "rd /s",
-        "reg delete",
-        "cipher /w",
+        "del /s /q",
     ]
 
-    command_lower = command.lower()
+    for fragment in blocked_fragments:
+        if fragment in lowered:
+            raise ValueError(
+                "Command blocked by the local safety guard."
+            )
 
-    for forbidden in blocked:
-        if forbidden in command_lower:
-            return f"BLOCKED dangerous command: {forbidden}"
+    result = subprocess.run(
+        command,
+        cwd=str(workspace),
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
 
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(workspace),
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+    output = (
+        f"returncode={result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
 
-        output = (
-            f"Return code: {result.returncode}\n\n"
-            f"STDOUT:\n{result.stdout}\n\n"
-            f"STDERR:\n{result.stderr}"
-        )
-
-        return truncate_output(output)
-
-    except subprocess.TimeoutExpired:
-        return "ERROR: Command timed out."
-
-    except Exception as e:
-        return f"ERROR running command: {e}"
+    return truncate_output(output)
 
 
-def run_tests(workspace: Path):
+def run_tests(workspace: Path) -> str:
     """
-    Run the project's test suite.
-    Prefer pytest, then fall back to unittest.
+    Run the complete pytest suite.
+
+    The agent must use this tool before claiming that tests
+    were executed.
     """
 
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
 
-    try:
-        result = subprocess.run(
-            ["python", "-m", "pytest", "-q"],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+    output = (
+        f"TEST_RETURN_CODE={result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}"
+    )
 
-        output = (
-            f"TEST COMMAND: python -m pytest -q\n"
-            f"RETURN CODE: {result.returncode}\n\n"
-            f"STDOUT:\n{result.stdout}\n\n"
-            f"STDERR:\n{result.stderr}"
-        )
-
-        # pytest exists, so return its actual result,
-        # including failures.
-        if "No module named pytest" not in (
-            result.stderr + result.stdout
-        ):
-            return truncate_output(output)
-
-    except subprocess.TimeoutExpired:
-        return "TEST RESULT: pytest timed out."
-
-    except Exception as e:
-        return f"pytest execution error: {e}"
-
-   
-
-    try:
-        result = subprocess.run(
-            [
-                "python",
-                "-m",
-                "unittest",
-                "discover",
-            ],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-
-        output = (
-            f"TEST COMMAND: python -m unittest discover\n"
-            f"RETURN CODE: {result.returncode}\n\n"
-            f"STDOUT:\n{result.stdout}\n\n"
-            f"STDERR:\n{result.stderr}"
-        )
-
-        return truncate_output(output)
-
-    except subprocess.TimeoutExpired:
-        return "TEST RESULT: unittest timed out."
-
-    except Exception as e:
-        return f"unittest execution error: {e}"
+    return truncate_output(output, 16_000)
 
 
-def git_status(workspace: Path):
-    return run_command(workspace, "git status --short")
+def git_status(workspace: Path) -> str:
+    result = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    return truncate_output(
+        f"returncode={result.returncode}\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
 
 
-def git_diff(workspace: Path):
-    return run_command(workspace, "git diff")
+def git_diff(workspace: Path) -> str:
+    result = subprocess.run(
+        ["git", "diff", "--"],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    return truncate_output(
+        f"returncode={result.returncode}\n"
+        f"{result.stdout}\n{result.stderr}",
+        20_000,
+    )
 
 
-
-TOOLS = {
-    "list_files": list_files,
-    "read_file": read_file,
-    "search_files": search_files,
-    "write_file": write_file,
-    "run_python": run_python,
-    "run_command": run_command,
-    "run_tests": run_tests,
-    "git_status": git_status,
-    "git_diff": git_diff,
-}
-
-
-TOOL_DOCUMENTATION = """
-AVAILABLE TOOLS
-
-1. list_files
-Purpose:
-Inspect the repository structure.
-
-Arguments:
-{
-  "path": "."
-}
-
-
-2. read_file
-Purpose:
-Read the actual contents of a file.
-
-Arguments:
-{
-  "path": "relative/path/to/file"
-}
-
-
-3. search_files
-Purpose:
-Search repository files for text.
-
-Arguments:
-{
-  "query": "text to search",
-  "path": "."
-}
-
-
-4. write_file
-Purpose:
-Create or replace a file.
-
-Arguments:
-{
-  "path": "relative/path/to/file",
-  "content": "complete file contents"
-}
-
-IMPORTANT:
-You MUST read a file before modifying an existing file.
-
-
-5. run_python
-Purpose:
-Run a Python script inside the workspace.
-
-Arguments:
-{
-  "script": "script.py"
-}
-
-
-6. run_command
-Purpose:
-Run a shell command inside the workspace.
-
-Arguments:
-{
-  "command": "command"
-}
-
-
-7. run_tests
-Purpose:
-Run the complete project test suite.
-
-Arguments:
-{}
-
-
-8. git_status
-Purpose:
-Show changed files.
-
-Arguments:
-{}
-
-
-9. git_diff
-Purpose:
-Show the actual changes.
-
-Arguments:
-{}
-
-
-TOOL-CALL FORMAT
-
-When you need a tool, output ONLY valid JSON:
-
-{
-  "tool": "tool_name",
-  "arguments": {
-    "argument": "value"
-  }
-}
-
-Do not use Markdown fences.
-
-Do not explain the tool call.
-
-Do not invent paths.
-
-Only use paths that were returned by list_files or discovered from actual repository files.
-
-When the requested task requires modifying code, you MUST actually call write_file.
-
-When the requested task requires testing, you MUST actually call run_tests.
-
-Never claim that a file was modified unless write_file successfully executed.
-
-Never claim that tests passed unless run_tests successfully executed and its result shows success.
-"""
-
+# ============================================================
+# Tool dispatcher
+# ============================================================
 
 def execute_tool(
     workspace: Path,
-    tool_name: str,
-    arguments: dict,
-):
-    if tool_name not in TOOLS:
-        return f"ERROR: Unknown tool '{tool_name}'."
+    name: str,
+    arguments: dict[str, Any],
+) -> str:
 
+    if name == "list_files":
+        return list_files(workspace)
+
+    if name == "read_file":
+        return read_file(
+            workspace,
+            arguments["filepath"],
+        )
+
+    if name == "search_files":
+        return search_files(
+            workspace,
+            arguments["query"],
+            arguments.get("file_pattern", "*"),
+        )
+
+    if name == "write_file":
+        return write_file(
+            workspace,
+            arguments["filepath"],
+            arguments["content"],
+        )
+
+    if name == "run_python":
+        return run_python(
+            workspace,
+            arguments["filepath"],
+        )
+
+    if name == "run_command":
+        return run_command(
+            workspace,
+            arguments["command"],
+        )
+
+    if name == "run_tests":
+        return run_tests(workspace)
+
+    if name == "git_status":
+        return git_status(workspace)
+
+    if name == "git_diff":
+        return git_diff(workspace)
+
+    raise ValueError(f"Unknown tool: {name}")
+
+
+# ============================================================
+# Model protocol
+# ============================================================
+
+TOOL_DESCRIPTIONS = """
+Available local-development tools:
+
+1. list_files
+   Arguments:
+   {}
+
+2. read_file
+   Arguments:
+   {"filepath": "relative/path.py"}
+
+3. search_files
+   Arguments:
+   {"query": "text", "file_pattern": "*.py"}
+
+4. write_file
+   Arguments:
+   {
+     "filepath": "relative/path.py",
+     "content": "complete file content"
+   }
+
+5. run_python
+   Arguments:
+   {"filepath": "relative/path.py"}
+
+6. run_command
+   Arguments:
+   {"command": "command"}
+
+7. run_tests
+   Arguments:
+   {}
+
+8. git_status
+   Arguments:
+   {}
+
+9. git_diff
+   Arguments:
+   {}
+
+Tool calls MUST be returned as JSON:
+
+{
+  "tool": "tool_name",
+  "arguments": {}
+}
+
+When the task is genuinely complete, return:
+
+{
+  "final": "your factual report"
+}
+"""
+
+
+SYSTEM_RULES = """
+You are an autonomous software-engineering agent.
+
+Your job is to inspect the ACTUAL repository, understand the task,
+make real changes when requested, validate those changes, and give
+a factual final report.
+
+STRICT EXECUTION RULES:
+
+1. NEVER invent file paths.
+   You must obtain paths from list_files or another repository
+   inspection tool.
+
+2. NEVER claim that a file was modified unless write_file actually
+   succeeded.
+
+3. NEVER claim that tests were executed unless run_tests actually
+   executed.
+
+4. NEVER claim that tests passed unless the actual run_tests result
+   indicates success.
+
+5. Before modifying a file:
+   - discover its exact path;
+   - read its current contents;
+   - understand the relevant code.
+
+6. Do not modify a file merely because its name suggests that it
+   contains the relevant code.
+
+7. For a modification task, the normal workflow is:
+
+   inspect
+   -> read relevant files
+   -> understand
+   -> modify
+   -> run tests
+   -> inspect failures
+   -> fix if necessary
+   -> rerun tests
+   -> final report
+
+8. If tests fail because of your change, diagnose the failure and
+   attempt a correction before finishing.
+
+9. Keep changes minimal and relevant to the user's task.
+
+10. Do not overwrite unrelated files.
+
+11. Use relative repository paths only.
+
+12. The final report must distinguish:
+    - files actually modified;
+    - tests actually executed;
+    - test result;
+    - anything that could not be verified.
+
+13. Do not output fake tool calls as prose.
+
+14. When a tool is needed, output ONLY the JSON tool-call object.
+
+15. Do not finish early simply because you know what change should
+    be made. Execute the change.
+
+16. If the user asks for a genuine repository improvement, a final
+    answer before write_file is NOT considered completion.
+"""
+
+
+def extract_json(text: str) -> dict[str, Any] | None:
+    """
+    Extract one JSON object from Gemma's response.
+    """
+
+    text = text.strip()
+
+    # Direct JSON.
     try:
-        tool = TOOLS[tool_name]
+        value = json.loads(text)
 
-        if tool_name == "list_files":
-            return tool(
-                workspace,
-                arguments.get("path", "."),
-            )
+        if isinstance(value, dict):
+            return value
 
-        if tool_name == "read_file":
-            return tool(
-                workspace,
-                arguments["path"],
-            )
+    except json.JSONDecodeError:
+        pass
 
-        if tool_name == "search_files":
-            return tool(
-                workspace,
-                arguments["query"],
-                arguments.get("path", "."),
-            )
+    # Markdown fenced JSON.
+    fenced = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
-        if tool_name == "write_file":
-            return tool(
-                workspace,
-                arguments["path"],
-                arguments["content"],
-            )
+    if fenced:
+        try:
+            value = json.loads(fenced.group(1))
 
-        if tool_name == "run_python":
-            return tool(
-                workspace,
-                arguments["script"],
-            )
+            if isinstance(value, dict):
+                return value
 
-        if tool_name == "run_command":
-            return tool(
-                workspace,
-                arguments["command"],
-            )
+        except json.JSONDecodeError:
+            pass
 
-        if tool_name == "run_tests":
-            return tool(workspace)
+    # Find first JSON object.
+    start = text.find("{")
 
-        if tool_name == "git_status":
-            return tool(workspace)
+    if start >= 0:
+        depth = 0
+        in_string = False
+        escaped = False
 
-        if tool_name == "git_diff":
-            return tool(workspace)
+        for index in range(start, len(text)):
+            char = text[index]
 
-        return "ERROR: Tool dispatch failed."
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
 
-    except KeyError as e:
-        return f"ERROR: Missing required argument: {e}"
+                continue
 
-    except Exception as e:
-        return f"ERROR executing {tool_name}: {e}"
+            if char == '"':
+                in_string = True
+
+            elif char == "{":
+                depth += 1
+
+            elif char == "}":
+                depth -= 1
+
+                if depth == 0:
+                    candidate = text[start:index + 1]
+
+                    try:
+                        value = json.loads(candidate)
+
+                        if isinstance(value, dict):
+                            return value
+
+                    except json.JSONDecodeError:
+                        return None
+
+    return None
 
 
+# ============================================================
+# Task detection
+# ============================================================
 
-def ollama_chat(
+def task_requires_modification(prompt: str) -> bool:
+    text = prompt.lower()
+
+    modification_terms = [
+        "modify",
+        "change",
+        "fix",
+        "implement",
+        "add",
+        "remove",
+        "update",
+        "refactor",
+        "improve",
+        "edit",
+        "create",
+        "correct",
+        "repair",
+        "patch",
+    ]
+
+    return any(term in text for term in modification_terms)
+
+
+def task_requires_tests(prompt: str) -> bool:
+    text = prompt.lower()
+
+    test_terms = [
+        "test",
+        "tests",
+        "pytest",
+        "validation",
+        "validate",
+        "verify",
+        "complete test suite",
+    ]
+
+    return any(term in text for term in test_terms)
+
+
+# ============================================================
+# Ollama
+# ============================================================
+
+def call_ollama(
     model: str,
-    messages: list,
-):
+    messages: list[dict[str, str]],
+) -> str:
+
     payload = {
         "model": model,
         "messages": messages,
         "stream": False,
         "options": {
-            "temperature": 0.1,
+            "temperature": 0.15,
         },
     }
 
@@ -599,212 +759,40 @@ def ollama_chat(
 
     data = response.json()
 
-    return data["message"]["content"]
+    message = data.get("message", {})
+    content = message.get("content", "")
+
+    if not content:
+        raise RuntimeError(
+            f"Ollama returned no message content: {data}"
+        )
+
+    return content
 
 
-
-
-def extract_json(text: str):
-    """
-    Extract JSON even if the model accidentally wraps it in
-    Markdown fences or surrounding prose.
-    """
-
-    text = text.strip()
-
-    # Direct JSON
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Markdown JSON block
-    fenced = re.search(
-        r"```(?:json)?\s*(\{.*?\})\s*```",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-
-    if fenced:
-        try:
-            return json.loads(fenced.group(1))
-        except Exception:
-            pass
-
-    # Find first JSON object
-    start = text.find("{")
-
-    if start >= 0:
-        depth = 0
-        in_string = False
-        escaped = False
-
-        for index in range(start, len(text)):
-            char = text[index]
-
-            if escaped:
-                escaped = False
-                continue
-
-            if char == "\\" and in_string:
-                escaped = True
-                continue
-
-            if char == '"':
-                in_string = not in_string
-                continue
-
-            if in_string:
-                continue
-
-            if char == "{":
-                depth += 1
-
-            elif char == "}":
-                depth -= 1
-
-                if depth == 0:
-                    candidate = text[start:index + 1]
-
-                    try:
-                        return json.loads(candidate)
-                    except Exception:
-                        break
-
-    return None
-
-
-def task_requires_modification(prompt: str) -> bool:
-    keywords = [
-        "implement",
-        "modify",
-        "change",
-        "edit",
-        "fix",
-        "improve",
-        "refactor",
-        "add",
-        "remove",
-        "update",
-        "create",
-        "write",
-    ]
-
-    text = prompt.lower()
-
-    return any(keyword in text for keyword in keywords)
-
-
-def task_requires_tests(prompt: str) -> bool:
-    text = prompt.lower()
-
-    return any(
-        keyword in text
-        for keyword in [
-            "test",
-            "tests",
-            "test suite",
-            "pytest",
-            "unittest",
-        ]
-    )
-
+# ============================================================
+# Agent
+# ============================================================
 
 def run_agent(
     model: str,
     workspace: Path,
     user_prompt: str,
-):
-    context = load_submission_context()
+) -> None:
 
-    modification_required = task_requires_modification(
-        user_prompt
-    )
-
-    tests_required = task_requires_tests(
-        user_prompt
-    )
-
-    # Track actual operations.
-    did_write = False
-    did_test = False
-    successful_writes = []
-    test_results = []
+    submission_context = load_submission_context()
 
     system_prompt = f"""
-You are Gemma Local Agent, an autonomous software engineering agent.
+{SYSTEM_RULES}
 
-You are operating inside this workspace:
+{TOOL_DESCRIPTIONS}
 
-{workspace}
+LOCAL SUBMISSION CONTEXT:
 
-You have access to the repository through tools.
-
-{TOOL_DOCUMENTATION}
-
-============================================================
-CRITICAL EXECUTION RULES
-============================================================
-
-You must actually perform requested actions.
-
-NEVER claim a file was changed unless write_file actually
-executed successfully.
-
-NEVER claim tests were run unless run_tests actually executed.
-
-NEVER invent a file path.
-
-For example, if list_files reports:
-
-tests/test_todo_service.py
-
-you MUST use exactly:
-
-tests/test_todo_service.py
-
-Do NOT invent:
-
-tests/services/todo_service.py
-
-Before modifying an existing file:
-
-1. Find the exact path.
-2. Read the file.
-3. Understand the relevant code.
-4. Modify it with write_file.
-
-For a modification task, do not stop after explaining what
-you intend to do.
-
-Continue using tools until the requested work is complete.
-
-For a task requiring tests:
-
-1. Make the change.
-2. Call run_tests.
-3. Inspect the result.
-4. If tests fail, investigate the failure.
-5. Modify the code if necessary.
-6. Run the tests again.
-7. Only then provide the final report.
-
-Your final report must distinguish between:
-
-- files actually changed
-- tests actually executed
-- actual test results
-
-Never fabricate any of these.
-
-============================================================
-SUBMISSION CONTEXT
-============================================================
-
-{context}
+{submission_context}
 """
 
-    messages = [
+    messages: list[dict[str, str]] = [
         {
             "role": "system",
             "content": system_prompt,
@@ -815,216 +803,312 @@ SUBMISSION CONTEXT
         },
     ]
 
+    requires_modification = task_requires_modification(
+        user_prompt
+    )
+
+    requires_tests = task_requires_tests(user_prompt)
+
+    did_write = False
+    did_test = False
+
+    successful_writes: list[str] = []
+    test_results: list[str] = []
+
+    print(f"Model: {model}")
+    print(f"Workspace: {workspace}")
+    print()
+
     for step in range(1, MAX_STEPS + 1):
 
-        print(f"\n[Agent step {step}]")
+        print(f"--- Agent step {step}/{MAX_STEPS} ---")
 
-        try:
-            response = ollama_chat(
-                model,
-                messages,
-            )
+        response = call_ollama(
+            model,
+            messages,
+        )
 
-        except Exception as e:
-            print(f"\n[Ollama error] {e}")
-            return
-
-        print(response)
+        print("Gemma response:")
+        print(truncate_output(response, 5000))
+        print()
 
         parsed = extract_json(response)
 
-     
+        if parsed is None:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response,
+                }
+            )
 
-        if isinstance(parsed, dict) and parsed.get("tool"):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was not a valid tool "
+                        "call or final JSON object. Continue the task. "
+                        "If a tool is required, return ONLY valid JSON "
+                        "using the specified tool-call format."
+                    ),
+                }
+            )
 
-            tool_name = parsed.get("tool")
+            continue
+
+        # ----------------------------------------------------
+        # Tool call
+        # ----------------------------------------------------
+
+        if "tool" in parsed:
+
+            tool_name = parsed["tool"]
             arguments = parsed.get("arguments", {})
 
             if not isinstance(arguments, dict):
                 arguments = {}
 
-            print(f"\n[Tool] {tool_name}")
+            print(f"Executing tool: {tool_name}")
+            print(f"Arguments: {arguments}")
 
-            result = execute_tool(
-                workspace,
-                tool_name,
-                arguments,
-            )
+            try:
+                result = execute_tool(
+                    workspace,
+                    tool_name,
+                    arguments,
+                )
 
-            print("\n[Tool result]")
-            print(result)
-
-
-            if tool_name == "write_file":
-                if result.startswith("Successfully wrote file:"):
+                if tool_name == "write_file":
                     did_write = True
 
-                    path = arguments.get("path")
+                    filepath = arguments.get(
+                        "filepath",
+                        "<unknown>",
+                    )
 
-                    if path:
-                        successful_writes.append(path)
+                    successful_writes.append(filepath)
 
-          
+                if tool_name == "run_tests":
+                    did_test = True
+                    test_results.append(result)
 
-            if tool_name == "run_tests":
-                did_test = True
-                test_results.append(result)
+                print("Tool result:")
+                print(truncate_output(result, 5000))
+                print()
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(parsed),
+                    }
+                )
 
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "TOOL RESULT:\n"
-                        f"{result}\n\n"
-                        "Continue the task. "
-                        "Do not give a final answer yet if "
-                        "required actions remain."
-                    ),
-                }
-            )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"TOOL RESULT ({tool_name}):\n"
+                            f"{result}\n\n"
+                            "Continue the task using the available "
+                            "tools. Do not claim actions that were "
+                            "not actually executed."
+                        ),
+                    }
+                )
+
+            except Exception as exc:
+                error = (
+                    f"TOOL ERROR ({tool_name}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                print(error)
+                print()
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(parsed),
+                    }
+                )
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{error}\n"
+                            "Correct the tool call and continue."
+                        ),
+                    }
+                )
 
             continue
 
+        # ----------------------------------------------------
+        # Final response
+        # ----------------------------------------------------
 
+        if "final" in parsed:
 
-        # Modification required but no actual write happened.
-        if modification_required and not did_write:
+            final_text = str(parsed.get("final", ""))
+
+            # Modification task but no actual write.
+            if requires_modification and not did_write:
+
+                print(
+                    "GUARD: Gemma attempted to finish before "
+                    "performing a real file modification."
+                )
+                print()
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(parsed),
+                    }
+                )
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You are NOT finished. The task requires "
+                            "a real repository modification, but "
+                            "write_file has not successfully executed. "
+                            "Inspect the exact source file, make the "
+                            "requested/genuine improvement with "
+                            "write_file, then continue."
+                        ),
+                    }
+                )
+
+                continue
+
+            # Test task but no tests.
+            if requires_tests and not did_test:
+
+                print(
+                    "GUARD: Gemma attempted to finish before "
+                    "running the requested tests."
+                )
+                print()
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": json.dumps(parsed),
+                    }
+                )
+
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You are NOT finished. The task requires "
+                            "testing, but run_tests has not executed. "
+                            "Run the complete test suite now. If tests "
+                            "fail, inspect the failure and fix the "
+                            "implementation before finishing."
+                        ),
+                    }
+                )
+
+                continue
+
+            print()
+            print("=" * 60)
+            print("FINAL REPORT")
+            print("=" * 60)
+            print(final_text)
+            print()
+
+            print("ACTUAL EXECUTION SUMMARY")
+            print("-" * 60)
+
+            if successful_writes:
+                print("Files actually modified:")
+                for filepath in successful_writes:
+                    print(f"  - {filepath}")
+            else:
+                print("Files actually modified: none")
 
             print(
-                "\n[Agent guard] "
-                "The model attempted to finish without "
-                "modifying a file. Continuing..."
+                f"Tests actually executed: "
+                f"{'YES' if did_test else 'NO'}"
             )
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
+            if did_test:
+                print(
+                    "Test executions recorded: "
+                    f"{len(test_results)}"
+                )
 
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "STOP. You have NOT completed the task.\n\n"
-                        "You have not successfully called write_file.\n"
-                        "Do not provide a final report.\n\n"
-                        "Continue inspecting the repository, "
-                        "identify the genuine improvement, "
-                        "and actually modify the correct file "
-                        "using write_file.\n\n"
-                        "Use exact paths from list_files/read_file."
-                    ),
-                }
-            )
+            print("=" * 60)
 
-            continue
+            return
 
-        # Tests required but not executed.
-        if tests_required and not did_test:
+        # ----------------------------------------------------
+        # Unknown JSON
+        # ----------------------------------------------------
 
-            print(
-                "\n[Agent guard] "
-                "The model attempted to finish without "
-                "running tests. Continuing..."
-            )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response,
+            }
+        )
 
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
-            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your JSON did not contain either 'tool' or "
+                    "'final'. Continue the task and return a valid "
+                    "tool call or final object."
+                ),
+            }
+        )
 
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "STOP. You have NOT completed the task.\n\n"
-                        "You have not successfully called run_tests.\n"
-                        "Do not claim test results.\n\n"
-                        "Run the complete test suite now using "
-                        "the run_tests tool.\n\n"
-                        "If tests fail, inspect the failure, "
-                        "fix the problem with write_file, "
-                        "and run the tests again."
-                    ),
-                }
-            )
-
-            continue
-
-
-
-
-
-        print(response)
-
-        if successful_writes:
-            print("\nActual files modified:")
-            for path in successful_writes:
-                print(f"  - {path}")
-
-        if did_test:
-            print("\nTests were actually executed.")
-        elif tests_required:
-            print("\nWARNING: Tests were not executed.")
-
-        return
-
-
-
-   
-    print("AGENT STOPPED")
-
+    print()
+    print("=" * 60)
+    print("AGENT STOPPED: MAXIMUM STEPS REACHED")
+    print("=" * 60)
     print(
-        f"Maximum tool steps ({MAX_STEPS}) reached."
+        f"Actual writes: "
+        f"{len(successful_writes)}"
+    )
+    print(
+        f"Tests actually executed: "
+        f"{'YES' if did_test else 'NO'}"
     )
 
-    if successful_writes:
-        print("\nFiles actually modified:")
-        for path in successful_writes:
-            print(f"  - {path}")
 
-    if did_test:
-        print("\nTests were executed.")
-    else:
-        print("\nTests were NOT executed.")
+# ============================================================
+# CLI
+# ============================================================
 
+def main() -> None:
 
-
-def main():
     parser = argparse.ArgumentParser(
-        description="Gemma Local Agent"
+        description="Local Gemma 4 Developer Agent runner"
     )
 
     parser.add_argument(
         "--model",
-        default=os.environ.get(
-            "OLLAMA_MODEL",
-            DEFAULT_MODEL,
-        ),
-        help="Ollama model name",
+        default=DEFAULT_MODEL,
+        help="Ollama model name.",
     )
 
     parser.add_argument(
         "--workspace",
-        default=".",
-        help="Repository workspace",
+        required=True,
+        help="Repository workspace.",
     )
 
     parser.add_argument(
         "--prompt",
         default=None,
-        help="One-shot task prompt",
+        help="One-shot task prompt.",
     )
 
     args = parser.parse_args()
@@ -1032,62 +1116,55 @@ def main():
     workspace = Path(args.workspace).resolve()
 
     if not workspace.exists():
-        print(
-            f"ERROR: Workspace does not exist:\n"
-            f"{workspace}"
+        raise SystemExit(
+            f"Workspace does not exist: {workspace}"
         )
-        return
 
     if not workspace.is_dir():
-        print(
-            f"ERROR: Workspace is not a directory:\n"
-            f"{workspace}"
+        raise SystemExit(
+            f"Workspace is not a directory: {workspace}"
         )
-        return
 
-    print("GEMMA LOCAL AGENT")
+    prompt = args.prompt
 
-    print(f"Model:     {args.model}")
-    print(f"Workspace: {workspace}")
-  
+    if not prompt:
+        print("Interactive mode.")
+        print("Type 'exit' to quit.")
+        print()
 
+        while True:
+            try:
+                prompt = input("Task> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
-    if args.prompt:
-        run_agent(
-            args.model,
-            workspace,
-            args.prompt,
-        )
-        return
+            if not prompt:
+                continue
 
+            if prompt.lower() in {
+                "exit",
+                "quit",
+            }:
+                break
 
-    print("Interactive mode.")
-    print("Type 'exit' or 'quit' to stop.")
+            run_agent(
+                model=args.model,
+                workspace=workspace,
+                user_prompt=prompt,
+            )
 
-    while True:
-
-        try:
-            prompt = input("\nYou: ").strip()
-
-        except (KeyboardInterrupt, EOFError):
             print()
-            break
 
-        if not prompt:
-            continue
+        return
 
-        if prompt.lower() in {
-            "exit",
-            "quit",
-        }:
-            break
-
-        run_agent(
-            args.model,
-            workspace,
-            prompt,
-        )
+    run_agent(
+        model=args.model,
+        workspace=workspace,
+        user_prompt=prompt,
+    )
 
 
 if __name__ == "__main__":
     main()
+
