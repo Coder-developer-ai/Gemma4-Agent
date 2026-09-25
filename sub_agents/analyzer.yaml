@@ -1,0 +1,5 @@
+# Repository Analyzer
+#
+# Optional placeholder. The root agent does not depend on this configuration.
+# Enable only after validating the exact current sub-agent/AgentTool schema
+# against the competition-provided HARNESS_README.md.

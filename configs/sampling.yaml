@@ -1,0 +1,4 @@
+# Submission 1 intentionally keeps sampling configuration minimal.
+#
+# Do not add speculative generation parameters. Use only fields explicitly
+# supported by the current competition harness schema.
