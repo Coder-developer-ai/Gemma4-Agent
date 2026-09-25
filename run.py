@@ -121,7 +121,7 @@ def list_files(workspace: Path, path: str = "."):
     for item in sorted(target.rglob("*")):
 
         # Ignore Python cache directories
-        if "__pycache__" in item.parts:
+        if "__pycache__" in item.parts or ".git" in item.parts:
             continue
 
         try:
