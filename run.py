@@ -303,9 +303,6 @@ def run_tests(workspace: Path):
     Prefer pytest, then fall back to unittest.
     """
 
-    # --------------------------------------------------------
-    # pytest
-    # --------------------------------------------------------
 
     try:
         result = subprocess.run(
@@ -336,9 +333,7 @@ def run_tests(workspace: Path):
     except Exception as e:
         return f"pytest execution error: {e}"
 
-    # --------------------------------------------------------
-    # unittest fallback
-    # --------------------------------------------------------
+   
 
     try:
         result = subprocess.run(
@@ -969,7 +964,6 @@ SUBMISSION CONTEXT
 
 
 
-        print("FINAL REPORT")
 
 
         print(response)
